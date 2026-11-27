@@ -45,6 +45,7 @@ async function run(): Promise<void> {
     dir,
     direction: command,
     ...(command === 'down' ? { count: 1 } : {}),
+    ignorePattern: '[.].*',
     migrationsTable: 'pgmigrations',
     checkOrder: true,
     singleTransaction: true,
