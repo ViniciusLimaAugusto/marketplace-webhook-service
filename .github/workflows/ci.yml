@@ -22,3 +22,60 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: ci-admin-only
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Provision the disposable test database
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec -i "$POSTGRES_CONTAINER" psql --username=postgres --set=ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE marketplace_test LOGIN PASSWORD 'ci-test-only';
+          CREATE ROLE marketplace_app NOLOGIN;
+          CREATE DATABASE marketplace_webhook_service OWNER marketplace_app;
+          REVOKE ALL ON DATABASE marketplace_webhook_service FROM PUBLIC;
+          CREATE DATABASE marketplace_webhook_service_test OWNER marketplace_test;
+          REVOKE ALL ON DATABASE marketplace_webhook_service_test FROM PUBLIC;
+          SQL
+      - run: npm run test:integration
+        env:
+          TEST_DATABASE_URL: postgresql://marketplace_test:ci-test-only@127.0.0.1:${{ job.services.postgres.ports[5432] }}/marketplace_webhook_service_test
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: docker compose config --quiet
+      - run: docker compose build
+      - run: docker compose up --wait db
+      - run: docker compose run --rm api node dist/infrastructure/database/command.js up
+      - run: docker compose up --wait api
+      - run: Invoke-WebRequest http://127.0.0.1:3000/
+        shell: pwsh
+      - if: failure()
+        run: docker compose logs
+      - if: always()
+        run: docker compose down --volumes
