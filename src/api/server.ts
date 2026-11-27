@@ -1,39 +1,73 @@
-import { parseEnv } from '../config/env.ts';
+import {
+  DatabaseConfigurationError,
+  parseDatabaseEnv,
+} from '../config/database.ts';
+import { EnvironmentConfigurationError, parseEnv } from '../config/env.ts';
+import {
+  createPool,
+  verifyConnection,
+} from '../infrastructure/database/pool.ts';
 import { buildApp } from './app.ts';
 
 async function start(): Promise<void> {
   const config = parseEnv(process.env);
+  const databaseConfig = parseDatabaseEnv(process.env);
   const app = buildApp(config);
-  const listening = app.listen({ host: config.HOST, port: config.PORT });
-  let closing: Promise<void> | undefined;
+  const pool = createPool(databaseConfig, () =>
+    app.log.error('Unexpected idle PostgreSQL client error'),
+  );
 
-  function close(signal?: NodeJS.Signals): Promise<void> {
-    closing ??= listening
+  let closing: Promise<void> | undefined;
+  const startup = (async () => {
+    try {
+      await verifyConnection(pool);
+    } catch {
+      app.log.error('PostgreSQL connection check failed during startup');
+      throw new Error('PostgreSQL startup check failed');
+    }
+    if (closing) return;
+    try {
+      await app.listen({ host: config.HOST, port: config.PORT });
+    } catch {
+      app.log.error('HTTP server failed to bind');
+      throw new Error('HTTP listener startup failed');
+    }
+  })();
+
+  function close(): Promise<void> {
+    closing ??= startup
       .catch(() => undefined)
-      .then(() => app.close())
-      .then(() => {
-        if (signal) app.log.info({ signal }, 'HTTP server shutdown complete');
-      })
-      .catch((err: unknown) => {
-        app.log.error({ err, signal }, 'HTTP server shutdown failed');
-        process.exitCode = 1;
+      .then(async () => {
+        try {
+          await app.close();
+          app.log.info('HTTP server shutdown complete');
+        } catch {
+          app.log.error('HTTP server shutdown failed');
+          process.exitCode = 1;
+        } finally {
+          try {
+            await pool.end();
+          } catch {
+            app.log.error('PostgreSQL pool shutdown failed');
+            process.exitCode = 1;
+          }
+        }
       });
     return closing;
   }
 
-  async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  function shutdown(signal: NodeJS.Signals): void {
     if (closing) return;
     app.log.info({ signal }, 'HTTP server shutting down');
-    await close(signal);
+    void close();
   }
 
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 
   try {
-    await listening;
-  } catch (err) {
-    app.log.error({ err }, 'HTTP server startup failed');
+    await startup;
+  } catch {
     process.exitCode = 1;
     await close();
   }
@@ -42,12 +76,14 @@ async function start(): Promise<void> {
 try {
   await start();
 } catch (error) {
-  // Configuration errors contain only the names of invalid variables.
   console.error(
     JSON.stringify({
       level: 'error',
       msg:
-        error instanceof Error ? error.message : 'HTTP server startup failed',
+        error instanceof DatabaseConfigurationError ||
+        error instanceof EnvironmentConfigurationError
+          ? error.message
+          : 'Server startup failed',
     }),
   );
   process.exitCode = 1;

@@ -19,12 +19,14 @@ const envSchema = z.object({
 
 export type Env = z.output<typeof envSchema>;
 
+export class EnvironmentConfigurationError extends Error {}
+
 export function parseEnv(input: Record<string, string | undefined>): Env {
   const result = envSchema.safeParse(input);
 
   if (!result.success) {
     const variables = result.error.issues.map((issue) => issue.path.join('.'));
-    throw new Error(
+    throw new EnvironmentConfigurationError(
       `Invalid environment configuration: ${variables.join(', ')}`,
     );
   }
